@@ -16,8 +16,6 @@ int main(int p_argc, const char *p_argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("s_url=%s\n", s_url);
-
     if(s_url == NULL) {
         serverInit();
 
