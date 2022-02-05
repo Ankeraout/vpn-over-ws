@@ -1,205 +1,124 @@
-#include <stdbool.h>
-#include <stddef.h>
-#include <string.h>
-#include <stdio.h>
-
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <openssl/bio.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <pthread.h>
+#include <libwebsockets.h>
 
 #include "common.h"
-#include "tun.h"
 
-static int initSocket(const char *url);
-static int initSSL(void);
-static int sendRequest(const char *url);
-static int startTun(void);
-static int startThread(void);
-static void *clientThreadMain(void *arg);
+struct t_clientInfo {
+    struct lws_context *context;
+    struct lws_vhost *vhost;
+    const struct lws_protocols *protocol;
+    struct lws_client_connect_info info;
+    struct lws *wsi;
+};
 
-bool clientConnected = false;
-int clientSocketClient;
-SSL_CTX *sslContext;
-SSL *ssl;
+static int callback_vpn(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+);
 
-int clientConnect(const char *url) {
-    // Initialize socket
-    if(initSocket(url) != 0) {
-        fprintf(stderr, "Failed to initialize socket.\n");
-        return 1;
-    }
+static struct lws_context *s_clientLwsContext;
 
-    // Initialize OpenSSL
-    if(initSSL() != 0) {
-        fprintf(stderr, "Failed to initialize OpenSSL.\n");
-        return 2;
-    }
+static struct t_clientInfo s_clientInfo;
 
-    // Send HTTP request
-    if(sendRequest(url) != 0) {
-        fprintf(stderr, "Failed to send HTTP request.\n");
-        return 3;
-    }
+int clientInit(const char *p_url) {
+    // Initialize LWS
+    const struct lws_protocols l_lwsProtocols[] = {
+        { "vpn", callback_vpn, sizeof(struct t_clientInfo), 1504, 0, NULL, 0 },
+        { NULL, NULL, 0, 0, 0, NULL, 0 }
+    };
 
-    // Start tun
-    if(startTun() != 0) {
-        fprintf(stderr, "Failed to send HTTP request.\n");
-        return 4;
-    }
+    struct lws_context_creation_info l_lwsCreateContextInfo;
+    memset(&l_lwsCreateContextInfo, 0, sizeof(l_lwsCreateContextInfo));
+    l_lwsCreateContextInfo.port = CONTEXT_PORT_NO_LISTEN,
+    l_lwsCreateContextInfo.protocols = l_lwsProtocols;
+    l_lwsCreateContextInfo.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
-    // Start client thread
-    if(startThread() != 0) {
-        fprintf(stderr, "Failed to start client thread.\n");
-        return 5;
-    }
+    s_clientLwsContext = lws_create_context(&l_lwsCreateContextInfo);
 
-    return 0;
-}
+    // Parse the URL
+    const char *l_protocol = NULL;
+    const char *l_address = NULL;
+    int l_port;
+    const char *l_path = NULL;
 
-static int initSocket(const char *url) {
-    char hostname[512];
+    char l_url[strlen(p_url) + 1];
+    strcpy(l_url, p_url);
 
-    if(sscanf(url, "https://%[^\\/]", hostname) == EOF) {
-        return 1;
-    }
-
-    printf("URL: %s\nHostname: %s\n", url, hostname);
-
-    struct hostent *host = gethostbyname(hostname);
-
-    if(host == NULL) {
-        perror(hostname);
-        return 2;
-    }
-
-    struct sockaddr_in clientSocketAddress;
-
-    clientSocketClient = socket(AF_INET, SOCK_STREAM, 0);
-    memset(&clientSocketAddress, 0, sizeof(clientSocketAddress));
-    clientSocketAddress.sin_family = AF_INET;
-    clientSocketAddress.sin_port = htons(443);
-    clientSocketAddress.sin_addr.s_addr = *(long *)(host->h_addr);
-
-    int returnValue = connect(
-        clientSocketClient,
-        (struct sockaddr *)&clientSocketAddress,
-        sizeof(clientSocketAddress)
+    int l_returnValue = lws_parse_uri(
+        l_url,
+        &l_protocol,
+        &l_address,
+        &l_port,
+        &l_path
     );
 
-    if(returnValue != 0) {
-        close(clientSocketClient);
-        perror("Connection failed");
-        return 3;
-    }
-
-    return 0;
-}
-
-static int initSSL(void) {
-    SSL_library_init();
-
-    OpenSSL_add_all_algorithms();
-    SSL_load_error_strings();
-
-    const SSL_METHOD *method = TLS_client_method();
-    sslContext = SSL_CTX_new(method);
-
-    if(sslContext == NULL) {
-        ERR_print_errors_fp(stderr);
+    if(l_returnValue) {
+        printf("Failed to parse URL.\n");
         return 1;
+    } else {
+        printf(
+            "URL: %s\nProtocol: %s\nAddress: %s\nPort: %d\nPath: %s\n",
+            p_url,
+            l_protocol,
+            l_address,
+            l_port,
+            l_path
+        );
     }
 
-    ssl = SSL_new(sslContext);
-    SSL_set_fd(ssl, clientSocketClient);
+    // Create client connect info
+    struct lws_client_connect_info l_lwsClientConnectInfo;
+    memset(&l_lwsClientConnectInfo, 0, sizeof(l_lwsClientConnectInfo));
 
-    if(SSL_connect(ssl) == -1) {
-        ERR_print_errors_fp(stderr);
-        return 2;
-    }
+    l_lwsClientConnectInfo.address = l_address;
+    l_lwsClientConnectInfo.port = l_port;
+    l_lwsClientConnectInfo.path = "/vpn/";
+    l_lwsClientConnectInfo.protocol = "vpn";
+    l_lwsClientConnectInfo.context = s_clientLwsContext;
+    l_lwsClientConnectInfo.host = l_address;
+    l_lwsClientConnectInfo.origin = l_address;
+    l_lwsClientConnectInfo.ietf_version_or_minus_one = -1;
+    l_lwsClientConnectInfo.pwsi = &s_clientInfo.wsi;
+    l_lwsClientConnectInfo.ssl_connection = LCCSCF_USE_SSL;
+
+    lws_client_connect_via_info(&l_lwsClientConnectInfo);
 
     return 0;
 }
 
-static int sendRequest(const char *url) {
-    char hostname[512];
-    char path[512];
+int clientExecute(void) {
+    return lws_service(s_clientLwsContext, 0);
+}
 
-    if(sscanf(url, "https://%[^\\/]%s", hostname, path) == EOF) {
-        return 1;
-    }
-
-    printf("URL: %s\nHostname: %s\nPath: %s\n", url, hostname, path);
-
-    char requestHeader[2048];
-
-    sprintf(
-        requestHeader,
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "User-Agent: http_vpn alpha 0.1\r\n"
-        "\r\n",
-        path,
-        hostname
-    );
-
-    SSL_write(ssl, requestHeader, strlen(requestHeader));
+int clientQuit(void) {
+    lws_context_destroy(s_clientLwsContext);
 
     return 0;
 }
 
-static int startTun(void) {
-    return tunInit("192.168.128.2");
-}
+static int callback_vpn(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+) {
+    M_UNUSED_PARAMETER(p_wsi);
+    M_UNUSED_PARAMETER(p_reason);
+    M_UNUSED_PARAMETER(p_user);
+    M_UNUSED_PARAMETER(p_in);
+    M_UNUSED_PARAMETER(p_len);
 
-static int startThread(void) {
-    pthread_t thread;
+    int l_returnValue = 0;
 
-    return pthread_create(
-        &thread,
-        NULL,
-        clientThreadMain,
-        NULL
-    );
-}
+    printf("callback_vpn() called. reason=%d\n", p_reason);
 
-static void *clientThreadMain(void *arg) {
-    UNUSED_PARAMETER(arg);
-
-    clientConnected = true;
-
-    while(true) {
-        uint16_t packetSize;
-
-        if(readForceSsl(ssl, &packetSize, 2) <= 0) {
+    switch(p_reason) {
+        default:
             break;
-        }
-
-        printf("Read\n");
-
-        uint8_t buffer[packetSize];
-
-        if(readForceSsl(ssl, buffer, packetSize) <= 0) {
-            break;
-        }
-
-        tunWrite(buffer, packetSize);
     }
 
-    clientConnected = false;
-
-    return NULL;
-}
-
-int clientWrite(const void *buffer, size_t bufferSize) {
-    if(clientConnected) {
-        SSL_write(ssl, buffer, bufferSize);
-    }
-
-    return 0;
+    return l_returnValue;
 }

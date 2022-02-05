@@ -1,196 +1,233 @@
 #include <stdbool.h>
-#include <stddef.h>
-#include <string.h>
-#include <stdio.h>
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <pthread.h>
+#include <libwebsockets.h>
 
 #include "common.h"
-#include "tun.h"
+#include "server.h"
 
-static void *serverListenThreadMain(void *arg);
-static void *clientReceiveThreadMain(void *arg);
+static struct lws_context *s_serverLwsContext;
 
-int serverSocket;
-pthread_t serverListenThread;
-int clientSocket = 0;
+struct t_serverInfo {
+    struct lws_context *context;
+    struct lws_vhost *vhost;
+    const struct lws_protocols *protocol;
+    struct lws_client_connect_info info;
+    struct lws *wsi;
+};
 
-int serverStart(void) {
-    if(tunInit("192.168.128.1")) {
-        fprintf(stderr, "Failed to create tun device.\n");
-        return 1;
-    }
+static int callback_vpn(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+);
 
-    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+static int callback_vpnInit(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+);
 
-    if(serverSocket < 0) {
-        perror("Failed to create the server socket");
-        return 1;
-    }
+static int callback_vpnNewClient(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+);
 
-    struct sockaddr_in serverSocketAddress = {
-        .sin_addr.s_addr = INADDR_ANY,
-        .sin_family = AF_INET,
-        .sin_port = htons(5228)
+static int callback_vpnReceive(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+);
+
+static int callback_vpnDisconnect(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+);
+
+int serverInit(void) {
+    const struct lws_protocols l_lwsProtocols[] = {
+        { "vpn", callback_vpn, sizeof(struct t_serverInfo), 1504, 0, NULL, 0 },
+        { NULL, NULL, 0, 0, 0, NULL, 0 }
     };
 
-    memset(
-        serverSocketAddress.sin_zero,
-        0,
-        sizeof(serverSocketAddress.sin_zero)
-    );
+    struct lws_context_creation_info l_lwsCreateContextInfo;
+    memset(&l_lwsCreateContextInfo, 0, sizeof(l_lwsCreateContextInfo));
+    l_lwsCreateContextInfo.port = 5228,
+    l_lwsCreateContextInfo.protocols = l_lwsProtocols;
 
-    if(
-        bind(
-            serverSocket,
-            (struct sockaddr *)&serverSocketAddress,
-            sizeof(serverSocketAddress)
-        ) != 0
-    ) {
-        perror("Failed to bind socket");
-        close(serverSocket);
-        return 1;
-    }
-
-    if(listen(serverSocket, 1) != 0) {
-        perror("Failed to put the server socket in listening state");
-        close(serverSocket);
-        return 1;
-    }
-
-    if(
-        pthread_create(
-            &serverListenThread,
-            NULL,
-            serverListenThreadMain,
-            NULL
-        ) != 0
-    ) {
-        perror("Failed to create listener thread");
-        close(serverSocket);
-        return 1;
-    }
-
-    printf("Server started.\n");
+    s_serverLwsContext = lws_create_context(&l_lwsCreateContextInfo);
 
     return 0;
 }
 
-static void *serverListenThreadMain(void *arg) {
-    UNUSED_PARAMETER(arg);
+int serverExecute(void) {
+    return lws_service(s_serverLwsContext, 0);
+}
 
-    int acceptedClient;
+int serverQuit(void) {
+    lws_context_destroy(s_serverLwsContext);
 
-    do {
-        struct sockaddr clientSocketAddress;
-        socklen_t clientSocketAddressLength = sizeof(clientSocketAddress);
+    return 0;
+}
 
-        acceptedClient = accept(
-            serverSocket,
-            &clientSocketAddress,
-            &clientSocketAddressLength
+static int callback_vpn(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+) {
+    printf("callback_vpn() called. reason=%d\n", p_reason);
+
+    int l_returnValue = 0;
+
+    switch(p_reason) {
+        case LWS_CALLBACK_PROTOCOL_INIT:
+            l_returnValue = callback_vpnInit(
+                p_wsi,
+                p_reason,
+                p_user,
+                p_in,
+                p_len
+            );
+
+            break;
+
+        case LWS_CALLBACK_ESTABLISHED:
+            l_returnValue = callback_vpnNewClient(
+                p_wsi,
+                p_reason,
+                p_user,
+                p_in,
+                p_len
+            );
+
+            break;
+
+        case LWS_CALLBACK_RECEIVE:
+            l_returnValue = callback_vpnReceive(
+                p_wsi,
+                p_reason,
+                p_user,
+                p_in,
+                p_len
+            );
+
+            break;
+
+        case LWS_CALLBACK_CLOSED:
+            l_returnValue = callback_vpnDisconnect(
+                p_wsi,
+                p_reason,
+                p_user,
+                p_in,
+                p_len
+            );
+
+            break;
+
+        default:
+            break;
+    }
+
+    return l_returnValue;
+}
+
+static int callback_vpnInit(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+) {
+    M_UNUSED_PARAMETER(p_reason);
+    M_UNUSED_PARAMETER(p_user);
+    M_UNUSED_PARAMETER(p_in);
+    M_UNUSED_PARAMETER(p_len);
+
+    struct lws_vhost *l_vhost = lws_get_vhost(p_wsi);
+    const struct lws_protocols *l_protocol = lws_get_protocol(p_wsi);
+
+    struct t_serverInfo *l_serverInfo =
+        lws_protocol_vh_priv_zalloc(
+            l_vhost,
+            l_protocol,
+            sizeof(struct t_serverInfo)
         );
 
-        if(acceptedClient >= 0) {
-            pthread_t clientThread;
+    l_serverInfo->context = lws_get_context(p_wsi);
+    l_serverInfo->protocol = l_protocol;
+    l_serverInfo->vhost = l_vhost;
 
-            if(
-                pthread_create(
-                    &clientThread,
-                    NULL,
-                    clientReceiveThreadMain,
-                    (void *)((size_t)acceptedClient)
-                ) != 0
-            ) {
-                perror("Failed to create client socket");
-                close(acceptedClient);
-            }
-        }
-    } while(acceptedClient >= 0);
+    printf("callback_vpnInit()\n");
 
-    return NULL;
+    return 0;
 }
 
-static void *clientReceiveThreadMain(void *arg) {
-    UNUSED_PARAMETER(arg);
+static int callback_vpnNewClient(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+) {
+    M_UNUSED_PARAMETER(p_wsi);
+    M_UNUSED_PARAMETER(p_reason);
+    M_UNUSED_PARAMETER(p_user);
+    M_UNUSED_PARAMETER(p_in);
+    M_UNUSED_PARAMETER(p_len);
 
-    printf("Accepted incoming client connection.\n");
+    printf("callback_vpnNewClient()\n");
 
-    clientSocket = (int)((size_t)arg);
-
-    // Ignore the HTTP request header
-    bool flag_cr = false;
-    int crlfCount = 0;
-    char buffer;
-
-    printf("clientSocket: %d\n", clientSocket);
-
-    int readResult = read(clientSocket, &buffer, 1);
-
-    do {   
-        printf("Read\n");
-        putc(buffer, stdout);
-
-        if(flag_cr) {
-            if(buffer == '\n') {
-                crlfCount++;
-            } else {
-                flag_cr = false;
-                crlfCount = 0;
-            }
-        } else if(buffer == '\r') {
-            flag_cr = true;
-        } else {
-            crlfCount = 0;
-        }
-
-        readResult = read(clientSocket, &buffer, 1);
-    } while((readResult > 0) && (crlfCount < 2));
-
-    if(crlfCount != 2) {
-        printf("Failed to parse HTTP request, disconnecting client.\n");
-        close(clientSocket);
-        return NULL;
-    }
-
-    printf("Passed HTTP header\n");
-
-    while(true) {
-        uint16_t packetLength;
-
-        ssize_t returnValue = readForce(clientSocket, &packetLength, sizeof(packetLength));
-
-        printf("Read\n");
-
-        if(returnValue <= 0) {
-            break;
-        }
-
-        uint8_t buffer[packetLength];
-
-        returnValue = readForce(clientSocket, &buffer, packetLength);
-
-        if(returnValue <= 0) {
-            break;
-        }
-
-        tunWrite(buffer, returnValue);
-    }
-
-    return NULL;
+    return 0;
 }
 
-int serverWrite(const void *buffer, size_t bufferSize) {
-    printf("serverWrite() called\n");
-    if(clientSocket != 0) {
-        printf("Sending\n");
-        write(clientSocket, buffer, bufferSize);
-    }
+static int callback_vpnReceive(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+) {
+    M_UNUSED_PARAMETER(p_wsi);
+    M_UNUSED_PARAMETER(p_reason);
+    M_UNUSED_PARAMETER(p_user);
+
+    char l_buffer[p_len + 1];
+
+    memcpy(l_buffer, p_in, p_len);
+    l_buffer[p_len] = '\0';
+
+    printf("Received data: %s\n", l_buffer);
+
+    return 0;
+}
+
+static int callback_vpnDisconnect(
+    struct lws *p_wsi,
+    enum lws_callback_reasons p_reason,
+	void *p_user,
+    void *p_in,
+    size_t p_len
+) {
+    M_UNUSED_PARAMETER(p_wsi);
+    M_UNUSED_PARAMETER(p_reason);
+    M_UNUSED_PARAMETER(p_user);
+    M_UNUSED_PARAMETER(p_in);
+    M_UNUSED_PARAMETER(p_len);
+
+    printf("Client disconnected\n");
 
     return 0;
 }

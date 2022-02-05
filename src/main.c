@@ -1,53 +1,65 @@
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "client.h"
 #include "server.h"
-#include "tun.h"
 
-bool flag_server = false;
-bool flag_tap = false;
-const char *url = NULL;
+static const char *s_url;
 
-static int parseCommandLineParameters(int argc, const char *argv[]);
+int parseCommandLineParameters(int p_argc, const char *p_argv[]);
 
-int main(int argc, const char *argv[]) {
-    if(parseCommandLineParameters(argc, argv) != 0) {
+int main(int p_argc, const char *p_argv[]) {
+    if(parseCommandLineParameters(p_argc, p_argv)) {
         return EXIT_FAILURE;
     }
 
-    if(flag_server) {
-        if(serverStart()) {
-            return EXIT_FAILURE;
-        }
-    } else {
-        if(clientConnect(url) != 0) {
-            return EXIT_FAILURE;
-        }
-    }
+    printf("s_url=%s\n", s_url);
 
-    tunLoop();
+    if(s_url == NULL) {
+        serverInit();
+
+        while(true) {
+            serverExecute();
+        }
+
+        serverQuit();
+    } else {
+        clientInit(s_url);
+
+        while(true) {
+            clientExecute();
+        }
+
+        clientQuit();
+    }
 
     return EXIT_SUCCESS;
 }
 
-static int parseCommandLineParameters(int argc, const char *argv[]) {
-    for(int i = 1; i < argc; i++) {
-        if(strcmp(argv[i], "--server") == 0) {
-            flag_server = true;
-        } else if(strcmp(argv[i], "--tap") == 0) {
-            flag_tap = true;
+int parseCommandLineParameters(int p_argc, const char *p_argv[]) {
+    s_url = NULL;
+
+    bool l_flagError = false;
+
+    for(int l_index = 1; l_index < p_argc; l_index++) {
+        const char *l_arg = p_argv[l_index];
+
+        printf("Arg: %s\n", l_arg);
+
+        if(s_url == NULL) {
+            s_url = l_arg;
         } else {
-            url = argv[i];
+            fprintf(stderr, "Error: too many URLs.\n");
+            l_flagError = true;
         }
     }
 
-    if((!flag_server) && (url == NULL)) {
-        fprintf(stderr, "Arguments parsing failed.\n");
+    if(l_flagError) {
         return 1;
+    } else {
+        return 0;
     }
-
-    return 0;
 }
