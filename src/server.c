@@ -1,11 +1,22 @@
 #include <stdbool.h>
 
 #include <libwebsockets.h>
+#include <semaphore.h>
+#include <pthread.h>
 
 #include "common.h"
 #include "server.h"
+#include "tun.h"
 
-static struct lws_context *s_serverLwsContext;
+#define C_READ_BUFFER_SIZE 1504
+
+static struct lws_context *s_serverLwsContext = NULL;
+static struct lws *s_clientWsi = NULL;
+static pthread_t s_serverTunReadThread;
+static sem_t s_clientSendSemaphore;
+static uint8_t s_clientSendBuffer[LWS_PRE + C_READ_BUFFER_SIZE];
+static size_t s_clientSendBufferSize;
+static bool s_sendRequest = false;
 
 struct t_serverInfo {
     struct lws_context *context;
@@ -14,6 +25,9 @@ struct t_serverInfo {
     struct lws_client_connect_info info;
     struct lws *wsi;
 };
+
+static int serverCreateTunReadThread(void);
+static void *serverTunReadThreadMain(void *p_arg);
 
 static int callback_vpn(
     struct lws *p_wsi,
@@ -57,7 +71,7 @@ static int callback_vpnDisconnect(
 
 int serverInit(void) {
     const struct lws_protocols l_lwsProtocols[] = {
-        { "vpn", callback_vpn, sizeof(struct t_serverInfo), 1504, 0, NULL, 0 },
+        { "vpn", callback_vpn, sizeof(struct t_serverInfo), 1504, 0, NULL, 1504 },
         { NULL, NULL, 0, 0, 0, NULL, 0 }
     };
 
@@ -68,7 +82,13 @@ int serverInit(void) {
 
     s_serverLwsContext = lws_create_context(&l_lwsCreateContextInfo);
 
+    sem_init(&s_clientSendSemaphore, 0, 1);
+
     return 0;
+}
+
+int serverStart(void) {
+    return serverCreateTunReadThread();
 }
 
 int serverExecute(void) {
@@ -81,6 +101,45 @@ int serverQuit(void) {
     return 0;
 }
 
+void serverSend(const void *p_buffer, size_t p_packetSize) {
+    if(s_clientWsi != NULL) {
+        sem_wait(&s_clientSendSemaphore);
+
+        memcpy(&s_clientSendBuffer[LWS_PRE], p_buffer, p_packetSize);
+        s_clientSendBufferSize = p_packetSize;
+
+        s_sendRequest = true;
+        lws_cancel_service(s_serverLwsContext);
+    }
+}
+
+static int serverCreateTunReadThread(void) {
+    return pthread_create(
+        &s_serverTunReadThread,
+        NULL,
+        serverTunReadThreadMain,
+        NULL
+    );
+}
+
+static void *serverTunReadThreadMain(void *p_arg) {
+    M_UNUSED_PARAMETER(p_arg);
+
+    while(true) {
+        uint8_t l_buffer[C_READ_BUFFER_SIZE];
+
+        ssize_t l_packetSize = tunRead(l_buffer);
+
+        if(l_packetSize <= 0) {
+            break;
+        }
+
+        serverSend(l_buffer, l_packetSize);
+    }
+
+    return NULL;
+}
+
 static int callback_vpn(
     struct lws *p_wsi,
     enum lws_callback_reasons p_reason,
@@ -88,8 +147,6 @@ static int callback_vpn(
     void *p_in,
     size_t p_len
 ) {
-    printf("callback_vpn() called. reason=%d\n", p_reason);
-
     int l_returnValue = 0;
 
     switch(p_reason) {
@@ -104,7 +161,7 @@ static int callback_vpn(
 
             break;
 
-        case LWS_CALLBACK_ESTABLISHED:
+        case LWS_CALLBACK_WSI_CREATE:
             l_returnValue = callback_vpnNewClient(
                 p_wsi,
                 p_reason,
@@ -112,6 +169,18 @@ static int callback_vpn(
                 p_in,
                 p_len
             );
+
+            break;
+
+        case LWS_CALLBACK_SERVER_WRITEABLE:
+            lws_write(p_wsi, &s_clientSendBuffer[LWS_PRE], s_clientSendBufferSize, LWS_WRITE_BINARY);
+            sem_post(&s_clientSendSemaphore);
+            break;
+
+        case LWS_CALLBACK_EVENT_WAIT_CANCELLED:
+            if(s_clientWsi != NULL && s_sendRequest) {
+                lws_callback_on_writable(s_clientWsi);
+            }
 
             break;
 
@@ -170,8 +239,6 @@ static int callback_vpnInit(
     l_serverInfo->protocol = l_protocol;
     l_serverInfo->vhost = l_vhost;
 
-    printf("callback_vpnInit()\n");
-
     return 0;
 }
 
@@ -182,13 +249,15 @@ static int callback_vpnNewClient(
     void *p_in,
     size_t p_len
 ) {
-    M_UNUSED_PARAMETER(p_wsi);
     M_UNUSED_PARAMETER(p_reason);
     M_UNUSED_PARAMETER(p_user);
     M_UNUSED_PARAMETER(p_in);
     M_UNUSED_PARAMETER(p_len);
 
-    printf("callback_vpnNewClient()\n");
+    s_clientWsi = (struct lws *)p_wsi;
+
+    sem_destroy(&s_clientSendSemaphore);
+    sem_init(&s_clientSendSemaphore, 0, 1);
 
     return 0;
 }
@@ -204,12 +273,7 @@ static int callback_vpnReceive(
     M_UNUSED_PARAMETER(p_reason);
     M_UNUSED_PARAMETER(p_user);
 
-    char l_buffer[p_len + 1];
-
-    memcpy(l_buffer, p_in, p_len);
-    l_buffer[p_len] = '\0';
-
-    printf("Received data: %s\n", l_buffer);
+    tunWrite(p_in, p_len);
 
     return 0;
 }
@@ -227,7 +291,7 @@ static int callback_vpnDisconnect(
     M_UNUSED_PARAMETER(p_in);
     M_UNUSED_PARAMETER(p_len);
 
-    printf("Client disconnected\n");
+    s_clientWsi = NULL;
 
     return 0;
 }

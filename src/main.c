@@ -6,6 +6,10 @@
 
 #include "client.h"
 #include "server.h"
+#include "tun.h"
+
+#define C_IP_TUN_SERVER "192.168.128.1"
+#define C_IP_TUN_CLIENT "192.168.128.2"
 
 static const char *s_url;
 
@@ -17,7 +21,17 @@ int main(int p_argc, const char *p_argv[]) {
     }
 
     if(s_url == NULL) {
-        serverInit();
+        if(serverInit()) {
+            return EXIT_FAILURE;
+        }
+
+        if(tunInit(C_IP_TUN_SERVER)) {
+            return EXIT_FAILURE;
+        }
+
+        if(serverStart()) {
+            return EXIT_FAILURE;
+        }
 
         while(true) {
             serverExecute();
@@ -25,7 +39,17 @@ int main(int p_argc, const char *p_argv[]) {
 
         serverQuit();
     } else {
-        clientInit(s_url);
+        if(clientInit(s_url)) {
+            return EXIT_FAILURE;
+        }
+
+        if(tunInit(C_IP_TUN_CLIENT)) {
+            return EXIT_FAILURE;
+        }
+
+        if(clientStart()) {
+            return EXIT_FAILURE;
+        }
 
         while(true) {
             clientExecute();
@@ -44,8 +68,6 @@ int parseCommandLineParameters(int p_argc, const char *p_argv[]) {
 
     for(int l_index = 1; l_index < p_argc; l_index++) {
         const char *l_arg = p_argv[l_index];
-
-        printf("Arg: %s\n", l_arg);
 
         if(s_url == NULL) {
             s_url = l_arg;

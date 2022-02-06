@@ -26,7 +26,7 @@ obj/%.o: src/%.c
 	$(CC) $(CFLAGS) $< -o $@
 
 $(EXECUTABLE): $(OBJECTS)
-	$(LD) $(LDFLAGS) $^ -o $@ -lwebsockets
+	$(LD) $(LDFLAGS) $^ -o $@ -lwebsockets -lpthread
 
 clean:
 	$(RM) bin obj
